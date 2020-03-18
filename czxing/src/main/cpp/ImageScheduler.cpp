@@ -7,7 +7,6 @@
 #include <src/BinaryBitmap.h>
 #include "ImageScheduler.h"
 #include "JNIUtils.h"
-#include "pthread.h"
 #include <unistd.h>
 
 int DEFAULT_MIN_LIGHT = 70;
@@ -17,8 +16,6 @@ int SCAN_TYPE_ZBAR = 2;
 int SCAN_TYPE_ADAPTIVE = 3;
 int SCAN_TYPE_CUSTOMIZE = 4;
 
-unsigned short MAX_THREAD_SUM = 4;
-
 ImageScheduler::ImageScheduler(JNIEnv *env, MultiFormatReader *_reader,
                                JavaCallHelper *javaCallHelper) {
     this->env = env;
@@ -27,7 +24,7 @@ ImageScheduler::ImageScheduler(JNIEnv *env, MultiFormatReader *_reader,
     qrCodeRecognizer = new QRCodeRecognizer();
     decodeQr = true;
     stopProcessing.store(false);
-    executor = new threadpool(MAX_THREAD_SUM);
+    isProcessing.store(false);
 }
 
 ImageScheduler::~ImageScheduler() {
@@ -35,11 +32,11 @@ ImageScheduler::~ImageScheduler() {
     DELETE(reader);
     DELETE(javaCallHelper);
     DELETE(qrCodeRecognizer);
-    DELETE(executor);
     frameQueue.clear();
+    delete &isProcessing;
     delete &stopProcessing;
     delete &cameraLight;
-    delete &executor;
+    delete &prepareThread;
     scanIndex = 0;
     decodeQr = 0;
 }
@@ -50,18 +47,13 @@ void *prepareMethod(void *arg) {
     return 0;
 }
 
-static void *decodeData(ImageScheduler *imageScheduler, FrameData *frameData) {
-    LOGD("==>decodeData");
-    imageScheduler->preTreatMat(frameData);
-    return 0;
-}
-
 void ImageScheduler::prepare() {
     pthread_create(&prepareThread, nullptr, prepareMethod, this);
 }
 
 void ImageScheduler::start() {
     stopProcessing.store(false);
+    isProcessing.store(false);
     frameQueue.setWork(1);
     scanIndex = -1;
 
@@ -70,27 +62,37 @@ void ImageScheduler::start() {
             break;
         }
 
+        if (isProcessing.load()) {
+            continue;
+        }
+
         FrameData frameData;
         int ret = frameQueue.deQueue(frameData);
         if (ret) {
-            executor->commit(&decodeData, this, &frameData);
+            isProcessing.store(true);
+            preTreatMat(frameData);
+            isProcessing.store(false);
         }
         usleep(50000);
     }
 }
 
 void ImageScheduler::stop() {
+    isProcessing.store(false);
     stopProcessing.store(true);
     frameQueue.setWork(0);
     frameQueue.clear();
     scanIndex = 0;
-    executor->stop();
 }
 
 void
 ImageScheduler::process(jbyte *bytes, int left, int top, int cropWidth, int cropHeight,
                         int rowWidth,
                         int rowHeight) {
+    if (isProcessing.load()) {
+        return;
+    }
+
     FrameData frameData;
     frameData.left = left;
     frameData.top = top;
@@ -114,48 +116,43 @@ ImageScheduler::process(jbyte *bytes, int left, int top, int cropWidth, int crop
 /**
  * 预处理二进制数据
  */
-void ImageScheduler::preTreatMat(FrameData *frameData) {
+void ImageScheduler::preTreatMat(const FrameData &frameData) {
     try {
         scanIndex++;
-        LOGD("start preTreatMat..., scanIndex = %d", scanIndex);
+        LOGE("start preTreatMat..., scanIndex = %d", scanIndex);
 
-        Mat src(frameData->rowHeight + frameData->rowHeight / 2,
-                frameData->rowWidth, CV_8UC1,
-                frameData->bytes);
+        Mat src(frameData.rowHeight + frameData.rowHeight / 2,
+                frameData.rowWidth, CV_8UC1,
+                frameData.bytes);
 
         Mat gray;
         cvtColor(src, gray, COLOR_YUV2GRAY_NV21);
-        src.release();
-        if (frameData->left != 0) {
+
+        if (frameData.left != 0) {
             gray = gray(
-                    Rect(frameData->left, frameData->top, frameData->cropWidth,
-                         frameData->cropHeight));
+                    Rect(frameData.left, frameData.top, frameData.cropWidth, frameData.cropHeight));
         }
 
         // 分析亮度，如果亮度过低，不进行处理
         analysisBrightness(gray);
         if (cameraLight < 30) {
-            gray.release();
             return;
         }
 
         // 不需要解析二维码
         if (!decodeQr) {
             decodeGrayPixels(gray);
-            gray.release();
             return;
         }
 
         // 正常解析策略 偶数次zxing解析，奇数次zbar解析
-        LOGD("==>start decode ");
         if (scanIndex % 2 == 0) {
             decodeGrayPixels(gray);
         } else {
             decodeZBar(gray);
         }
-        gray.release();
     } catch (const std::exception &e) {
-        LOGD("preTreatMat error...%s", e.what());
+        LOGE("preTreatMat error...");
     }
 }
 
